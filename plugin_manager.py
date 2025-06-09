@@ -6,9 +6,7 @@ import subprocess
 import shutil
 
 # ==============================================================================
-# PLUGIN DATABASE
-# Maps a recognizable part of a plugin's name to its description and a
-# star rating for "Industry Impact & Reputation".
+# PLUGIN DATABASE (Your database remains unchanged)
 # ==============================================================================
 PLUGIN_DATABASE = {
     "ADPTR MetricAB": ("A referencing tool to A/B your mix against other tracks.", 5),
@@ -124,7 +122,6 @@ class PluginManager(tk.Tk):
         # --- Style Configuration ---
         style = ttk.Style(self)
         style.configure("Treeview", rowheight=25)
-        # NOTE: Tag configuration is now done AFTER the treeview is created.
 
         # --- Main Frame ---
         main_frame = ttk.Frame(self, padding="10")
@@ -137,7 +134,7 @@ class PluginManager(tk.Tk):
         self.scan_button = ttk.Button(controls_frame, text="Scan for Plugins", command=self.scan_and_display_plugins)
         self.scan_button.pack(side=tk.LEFT)
 
-        self.delete_button = ttk.Button(controls_frame, text="Delete Selected", command=self.delete_selected_plugin, state=tk.DISABLED)
+        self.delete_button = ttk.Button(controls_frame, text="Delete Selected", command=self.delete_selected_plugins, state=tk.DISABLED)
         self.delete_button.pack(side=tk.RIGHT)
         
         self.status_label = ttk.Label(controls_frame, text="Ready. Click 'Scan for Plugins' to begin.")
@@ -147,7 +144,8 @@ class PluginManager(tk.Tk):
         tree_frame = ttk.Frame(main_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
         
-        self.tree = ttk.Treeview(tree_frame, columns=("type", "path"), show="tree headings")
+        # Enable multiple selections
+        self.tree = ttk.Treeview(tree_frame, columns=("type", "path"), show="tree headings", selectmode="extended")
         self.tree.heading("#0", text="Plugin / Description")
         self.tree.heading("type", text="Format")
         self.tree.heading("path", text="Full Path")
@@ -156,8 +154,6 @@ class PluginManager(tk.Tk):
         self.tree.column("type", width=120, anchor=tk.W)
         self.tree.column("path", width=580, anchor=tk.W)
 
-        # ****** CORRECTED CODE IS HERE ******
-        # Custom tag for the description row, configured on the tree itself.
         self.tree.tag_configure("description", foreground="gray40")
         
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -195,14 +191,20 @@ class PluginManager(tk.Tk):
         self.status_label.config(text=f"Scan complete. Found {sum(len(v) for v in found_plugins.values())} plugin files.")
         return found_plugins
 
-    def populate_tree(self, plugins):
+    def populate_tree(self, plugins, open_groups=None):
+        """Populates the tree, optionally keeping specified groups open."""
+        if open_groups is None:
+            open_groups = set()
+
         for i in self.tree.get_children():
             self.tree.delete(i)
         
         sorted_plugin_names = sorted(plugins.keys(), key=lambda s: s.lower())
         
         for name in sorted_plugin_names:
-            parent_id = self.tree.insert("", tk.END, text=name, open=False, tags=('group',))
+            # Check if this group should be open
+            is_open = name in open_groups
+            parent_id = self.tree.insert("", tk.END, text=name, open=is_open, tags=('group',))
             
             description, stars = find_plugin_info(name)
             if description and stars:
@@ -220,72 +222,116 @@ class PluginManager(tk.Tk):
                     tags=('plugin_file',)
                 )
 
-    def scan_and_display_plugins(self):
+    def scan_and_display_plugins(self, open_groups=None):
+        """Scans and repopulates the tree, preserving open group state."""
         plugins = self.scan_plugins()
-        self.populate_tree(plugins)
+        self.populate_tree(plugins, open_groups)
 
     def on_tree_select(self, event):
-        selected_item = self.tree.selection()
-        if not selected_item:
+        """NEW: Enables delete button if any selected item is a deletable file."""
+        selected_items = self.tree.selection()
+        if not selected_items:
             self.delete_button.config(state=tk.DISABLED)
             return
 
-        item_id = selected_item[0]
-        item_tags = self.tree.item(item_id, "tags")
+        # Check if at least one of the selected items is a real plugin file
+        is_any_file_selected = any(
+            'plugin_file' in self.tree.item(item_id, "tags") 
+            for item_id in selected_items
+        )
 
-        if 'plugin_file' in item_tags:
+        if is_any_file_selected:
             self.delete_button.config(state=tk.NORMAL)
         else:
             self.delete_button.config(state=tk.DISABLED)
 
-    def delete_selected_plugin(self):
-        selected_item = self.tree.selection()
-        if not selected_item: return
+    def delete_selected_plugins(self):
+        """
+        NEW AND IMPROVED: Deletes all selected plugin files, handles multiple
+        system files with a single password prompt, and preserves the open
+        state of non-deleted groups.
+        """
+        selected_items = self.tree.selection()
+        if not selected_items: return
 
-        item_id = selected_item[0]
-        item_tags = self.tree.item(item_id, "tags")
+        # --- BONUS POINTS: Record which groups are currently open ---
+        open_groups_before_delete = set()
+        for item_id in self.tree.get_children(''): # Get top-level items
+            if self.tree.item(item_id, 'open'):
+                group_name = self.tree.item(item_id, 'text')
+                open_groups_before_delete.add(group_name)
 
-        if 'plugin_file' not in item_tags:
-            messagebox.showwarning("Selection Error", "You can only delete plugin files, not descriptions or group names.")
+        # --- Step 1: Collect all valid file paths to delete ---
+        paths_to_delete = []
+        for item_id in selected_items:
+            item_tags = self.tree.item(item_id, "tags")
+            if 'plugin_file' in item_tags:
+                plugin_path_str = self.tree.item(item_id, "values")[1]
+                paths_to_delete.append(plugin_path_str)
+
+        if not paths_to_delete:
+            messagebox.showwarning("Selection Error", "No plugin files selected. Please select one or more files (indented with ↳) to delete.")
             return
 
-        item_details = self.tree.item(item_id)
-        plugin_path_str = item_details["values"][1]
-        
+        # --- Step 2: Confirm with the user ---
+        file_list = "\n".join(f"- {os.path.basename(p)}" for p in paths_to_delete)
         confirmed = messagebox.askyesno(
             "Confirm Deletion",
-            f"Are you sure you want to permanently delete this file?\n\n{plugin_path_str}"
+            f"Are you sure you want to permanently delete these {len(paths_to_delete)} files?\n\n{file_list}"
         )
         if not confirmed: return
 
-        plugin_path = pathlib.Path(plugin_path_str)
+        # --- Step 3: Separate files into user-level and system-level ---
+        user_files = []
+        system_files = []
         user_home_path = pathlib.Path.home()
 
-        try:
-            if plugin_path.is_relative_to(user_home_path):
-                self.status_label.config(text=f"Deleting user plugin...")
-                self.update_idletasks()
-                if plugin_path.is_dir(): shutil.rmtree(plugin_path)
-                else: os.remove(plugin_path)
-                messagebox.showinfo("Success", f"Successfully deleted (no password needed):\n{plugin_path_str}")
+        for path_str in paths_to_delete:
+            p = pathlib.Path(path_str)
+            if p.is_relative_to(user_home_path):
+                user_files.append(p)
             else:
-                self.status_label.config(text=f"Deleting system plugin... Password may be required.")
+                system_files.append(str(p)) # Keep as string for shell command
+
+        # --- Step 4: Delete the files ---
+        try:
+            # Delete user files directly (no password needed)
+            if user_files:
+                self.status_label.config(text=f"Deleting {len(user_files)} user plugin(s)...")
                 self.update_idletasks()
-                script = f'do shell script "rm -rf \\"{plugin_path_str}\\"" with administrator privileges'
+                for p in user_files:
+                    if p.is_dir(): shutil.rmtree(p)
+                    else: os.remove(p)
+            
+            # Delete system files with a single admin command
+            if system_files:
+                self.status_label.config(text=f"Deleting {len(system_files)} system plugin(s)... Password may be required.")
+                self.update_idletasks()
+                
+                # Quote each path to handle spaces, then join them for the shell command
+                quoted_paths = [f'\\"{path}\\"' for path in system_files]
+                rm_command = f'rm -rf {" ".join(quoted_paths)}'
+                
+                # Build and run the AppleScript
+                script = f'do shell script "{rm_command}" with administrator privileges'
                 result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
 
-                if result.returncode == 0:
-                    messagebox.showinfo("Success", f"Successfully deleted:\n{plugin_path_str}")
-                else:
+                if result.returncode != 0:
                     error_message = result.stderr.strip()
-                    if "User canceled" in error_message: raise RuntimeError("Deletion was cancelled by user.")
-                    else: raise RuntimeError(f"Deletion failed:\n\n{error_message}")
-            
-            self.scan_and_display_plugins()
+                    if "User canceled" in error_message:
+                        raise RuntimeError("Deletion was cancelled by the user.")
+                    else:
+                        raise RuntimeError(f"Admin deletion failed:\n\n{error_message}")
 
+            messagebox.showinfo("Success", f"Successfully deleted {len(paths_to_delete)} plugin file(s).")
+            
         except Exception as e:
             messagebox.showerror("Error", str(e))
             self.status_label.config(text="An error occurred during deletion.")
+        
+        finally:
+            # --- Step 5: Refresh the list, preserving the open state ---
+            self.scan_and_display_plugins(open_groups=open_groups_before_delete)
 
 
 if __name__ == "__main__":
